@@ -141,8 +141,9 @@ function extrachill_cache_gc( $args = array() ) {
 	$deleted      = 0;
 	$bytes        = 0;
 	$emptied_dirs = array();
-	$next_cursor  = '';
-	$started      = false;
+	$next_cursor      = '';
+	$started          = false;
+	$budget_exhausted = false;
 
 	$iterator = new RecursiveIteratorIterator(
 		new RecursiveDirectoryIterator( $base, RecursiveDirectoryIterator::SKIP_DOTS ),
@@ -152,9 +153,10 @@ function extrachill_cache_gc( $args = array() ) {
 	foreach ( $iterator as $file ) {
 		$path = $file->getPathname();
 
-		// Resume from the previous cursor, if any. Files are yielded in
-		// filesystem order, so equality is the simplest reliable signal; if the
-		// cursor file no longer exists the walk simply starts fresh next run.
+		// Resume from the previous cursor, if any. The cursor is always set to
+		// a KEPT file (never a deleted one), so it normally still exists on the
+		// next run. If it was removed by a content-change purge the walk
+		// exhausts without examining anything and the cursor is cleared below.
 		if ( '' !== $cursor && ! $started ) {
 			if ( $path === $cursor ) {
 				$started = true;
@@ -169,6 +171,7 @@ function extrachill_cache_gc( $args = array() ) {
 		if ( ! $file->isFile() || '.html' !== substr( $path, -5 ) ) {
 			$next_cursor = $path;
 			if ( extrachill_cache_gc_should_stop( $start, $examined, $args ) ) {
+				$budget_exhausted = true;
 				break;
 			}
 			continue;
@@ -178,6 +181,7 @@ function extrachill_cache_gc( $args = array() ) {
 		if ( false !== $mtime && $mtime >= $cutoff ) {
 			$next_cursor = $path;
 			if ( extrachill_cache_gc_should_stop( $start, $examined, $args ) ) {
+				$budget_exhausted = true;
 				break;
 			}
 			continue;
@@ -200,30 +204,34 @@ function extrachill_cache_gc( $args = array() ) {
 			$bytes += $size;
 		}
 
-		$next_cursor = $path;
+		// Do NOT advance $next_cursor to a deleted file: it won't exist on the
+		// next run, so it can't serve as a resume point. $next_cursor retains
+		// the last KEPT file's path (fresh .html or non-cache file), which is
+		// stable across runs. If the entire batch was expired (no kept file
+		// seen), $next_cursor stays '' and the cursor is cleared below so the
+		// next run starts fresh — at most one no-op run, self-correcting.
 		if ( extrachill_cache_gc_should_stop( $start, $examined, $args ) ) {
+			$budget_exhausted = true;
 			break;
 		}
 	}
 
-	$completed = false;
-	if ( '' === $next_cursor ) {
-		// The tree was empty or the iterator never advanced.
-		$completed = true;
-	} elseif ( extrachill_cache_gc_should_stop( $start, $examined, $args ) ) {
-		// Budget exhausted before the end; resume next run.
-		$completed = false;
-	} else {
-		// Iterator exhausted without hitting the budget.
-		$completed = true;
-	}
+	// The walk completed if the iterator was exhausted naturally (no budget
+	// break). A stale cursor (cursor file purged between runs) causes the
+	// iterator to exhaust without examining anything; that clears the cursor
+	// so the next run starts fresh — one no-op run, self-correcting.
+	$completed = ! $budget_exhausted;
 
 	if ( ! $args['dry_run'] ) {
 		extrachill_cache_gc_remove_empty_dirs( array_keys( $emptied_dirs ) );
 
-		if ( $completed ) {
+		if ( $completed || '' === $next_cursor ) {
+			// Walk finished, or the batch was all-expired with no kept file to
+			// anchor a resume point. Clear the cursor so the next run starts
+			// from the beginning of the tree.
 			delete_option( 'extrachill_cache_gc_cursor' );
 		} else {
+			// Resume from the last kept file on the next run.
 			update_option( 'extrachill_cache_gc_cursor', $next_cursor, false );
 		}
 	}
