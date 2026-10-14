@@ -135,6 +135,10 @@ function extrachill_cache_compose_dropin() {
 /**
  * Install the advanced-cache.php drop-in and enable WP_CACHE.
  *
+ * The write is atomic: the composed file goes to a temp file in the same
+ * directory and is rename()d over the drop-in, so a request that bootstraps
+ * mid-install can never include a half-written advanced-cache.php.
+ *
  * Refuses to overwrite a drop-in owned by another plugin (e.g. a leftover
  * Breeze advanced-cache.php) unless it is ours — the cutover docs instruct the
  * owner to remove Breeze's drop-in first.
@@ -160,9 +164,39 @@ function extrachill_cache_install_dropin( $set_wp_cache_constant = true ) {
 		return false;
 	}
 
-	// phpcs:ignore WordPress.PHP.NoSilencedErrors.Discouraged, WordPress.WP.AlternativeFunctions.file_system_operations_file_put_contents -- Writes wp-content/advanced-cache.php directly; runs at the drop-in install layer before WP_Filesystem exists. The @ suppresses a benign write failure (handled via the false check).
-	if ( false === @file_put_contents( $dropin, $contents, LOCK_EX ) ) {
+	// Write the composed drop-in to a uniquely named temp file in the same
+	// directory, then rename() it over the drop-in. file_put_contents()
+	// truncates the target before writing, so a request bootstrapping during
+	// that window includes a half-written advanced-cache.php and dies with a
+	// parse error (the production incident behind this change). LOCK_EX is no
+	// protection there: it is an advisory flock that PHP's include/opcache
+	// never takes. A same-filesystem rename() is atomic on POSIX, so readers
+	// see either the complete old file or the complete new file, never a
+	// truncated one. The temp name is unique per call; two racing refreshers
+	// each rename a complete file and the last rename wins, which is safe.
+	$temp = dirname( $dropin ) . '/advanced-cache.php.tmp-' . uniqid( '', true );
+
+	// phpcs:ignore WordPress.PHP.NoSilencedErrors.Discouraged, WordPress.WP.AlternativeFunctions.file_system_operations_file_put_contents -- Writes a temp file beside wp-content/advanced-cache.php directly; runs at the drop-in install layer before WP_Filesystem exists. The @ suppresses a benign write failure (handled via the false check).
+	if ( false === @file_put_contents( $temp, $contents, LOCK_EX ) ) {
+		// The temp file may exist partially written (e.g. disk full); never
+		// leave it behind.
+		// phpcs:ignore WordPress.PHP.NoSilencedErrors.Discouraged, WordPress.WP.AlternativeFunctions.unlink_unlink -- Removes our own failed temp file directly; runs at the drop-in layer before WP_Filesystem/wp_delete_file are guaranteed available.
+		@unlink( $temp );
 		return false;
+	}
+
+	// phpcs:ignore WordPress.PHP.NoSilencedErrors.Discouraged, WordPress.WP.AlternativeFunctions.rename_rename -- Atomic same-filesystem rename over the drop-in; runs at the drop-in install layer before WP_Filesystem exists. The @ suppresses a benign rename failure (handled via the false check).
+	if ( ! @rename( $temp, $dropin ) ) {
+		// phpcs:ignore WordPress.PHP.NoSilencedErrors.Discouraged, WordPress.WP.AlternativeFunctions.unlink_unlink -- Removes our own failed temp file directly; runs at the drop-in layer before WP_Filesystem/wp_delete_file are guaranteed available.
+		@unlink( $temp );
+		return false;
+	}
+
+	// advanced-cache.php is included on every request before opcache would
+	// otherwise notice the file was replaced, so drop any cached bytecode for
+	// the old file. Guarded: opcache may not be loaded (CLI, other SAPIs).
+	if ( function_exists( 'opcache_invalidate' ) ) {
+		opcache_invalidate( $dropin, true );
 	}
 
 	// Only activation owns the WP_CACHE constant in wp-config.php. A drop-in
